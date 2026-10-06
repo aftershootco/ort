@@ -1,4 +1,25 @@
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
+
+/// QNN backend selected independently of the device descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QNNBackendType {
+	/// QNN CPU backend.
+	Cpu,
+	/// QNN GPU backend.
+	Gpu,
+	/// QNN HTP/NPU backend.
+	Htp
+}
+
+impl QNNBackendType {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Cpu => "cpu",
+			Self::Gpu => "gpu",
+			Self::Htp => "htp"
+		}
+	}
+}
 
 use super::{ExecutionProvider, ExecutionProviderOptions, RegisterError};
 use crate::{error::Result, session::builder::SessionBuilder};
@@ -74,12 +95,27 @@ impl QNNContextPriority {
 
 #[derive(Debug, Default, Clone)]
 pub struct QNNExecutionProvider {
-	options: ExecutionProviderOptions
+	options: ExecutionProviderOptions,
+	provider_library_path: Option<String>
 }
 
 super::impl_ep!(arbitrary; QNNExecutionProvider);
 
 impl QNNExecutionProvider {
+	/// Load the QNN execution provider from a shared library rather than the built-in provider.
+	#[must_use]
+	pub fn with_provider_library_path(mut self, path: impl ToString) -> Self {
+		self.provider_library_path = Some(path.to_string());
+		self
+	}
+
+	/// Select the QNN SDK backend; do not combine this with `backend_path`.
+	#[must_use]
+	pub fn with_backend_type(mut self, backend: QNNBackendType) -> Self {
+		self.options.set("backend_type", backend.as_str());
+		self
+	}
+
 	/// The file path to QNN backend library. On Linux/Android, this is `libQnnCpu.so` to use the CPU backend,
 	/// or `libQnnHtp.so` to use the accelerated backend.
 	#[must_use]
@@ -190,6 +226,28 @@ impl ExecutionProvider for QNNExecutionProvider {
 			use crate::{AsPointer, ortsys};
 
 			let ffi_options = self.options.to_ffi();
+			if let Some(library_path) = &self.provider_library_path {
+				use core::{ffi::CStr, ptr, slice};
+				let environment = crate::environment::get_environment()?;
+				environment.register_execution_provider_library(self.name(), library_path)?;
+				let mut devices = ptr::null();
+				let mut count = 0;
+				ortsys![unsafe GetEpDevices(environment.ptr(), &mut devices, &mut count)?];
+				if devices.is_null() || count == 0 {
+					return Err(crate::Error::new("No devices exposed by the QNN execution provider library").into());
+				}
+				// ORT 1.22 describes the Qualcomm device as NPU; backend_type selects GPU execution.
+				let device = unsafe { slice::from_raw_parts(devices, count) }
+					.iter()
+					.copied()
+					.find(|device| unsafe { CStr::from_ptr((crate::api().EpDevice_EpName)(*device)) }.to_bytes() == self.name().as_bytes())
+					.ok_or_else(|| crate::Error::new("QNN execution provider device is unavailable"))?;
+				ortsys![unsafe SessionOptionsAppendExecutionProvider_V2(
+					session_builder.ptr_mut(), environment.ptr().cast_mut(), &device, 1,
+					ffi_options.key_ptrs(), ffi_options.value_ptrs(), ffi_options.len()
+				)?];
+				return Ok(());
+			}
 			ortsys![unsafe SessionOptionsAppendExecutionProvider(
 				session_builder.ptr_mut(),
 				c"QNN".as_ptr().cast::<core::ffi::c_char>(),

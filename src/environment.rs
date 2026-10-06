@@ -29,7 +29,7 @@ use crate::{
 	execution_providers::ExecutionProviderDispatch,
 	logging::{LogLevel, LoggerFunction},
 	ortsys,
-	util::{OnceLock, STACK_EXECUTION_PROVIDERS, with_cstr}
+	util::{MiniMap, Mutex, OnceLock, STACK_EXECUTION_PROVIDERS, str_to_os_char, with_cstr}
 };
 
 static G_ENV: OnceLock<Environment> = OnceLock::new();
@@ -47,6 +47,7 @@ pub struct Environment {
 	pub(crate) execution_providers: SmallVec<ExecutionProviderDispatch, { STACK_EXECUTION_PROVIDERS }>,
 	ptr: NonNull<ort_sys::OrtEnv>,
 	pub(crate) has_global_threadpool: bool,
+	provider_libraries: Mutex<MiniMap<String, String>>,
 	_thread_manager: Option<Box<dyn Any>>,
 	_logger: Option<LoggerFunction>
 }
@@ -55,6 +56,25 @@ unsafe impl Send for Environment {}
 unsafe impl Sync for Environment {}
 
 impl Environment {
+	/// Register an execution provider library once for this environment.
+	pub fn register_execution_provider_library(&self, name: &str, path: &str) -> Result<()> {
+		let mut libraries = self.provider_libraries.lock();
+		if let Some(registered) = libraries.get(name) {
+			return if registered == path {
+				Ok(())
+			} else {
+				Err(crate::Error::new("Execution provider library name is already registered with a different path"))
+			};
+		}
+		let library_path = str_to_os_char(path);
+		with_cstr(name.as_bytes(), &|name| {
+			ortsys![unsafe RegisterExecutionProviderLibrary(self.ptr().cast_mut(), name.as_ptr(), library_path.as_ptr())?];
+			Ok(())
+		})?;
+		libraries.insert(name.into(), path.into());
+		Ok(())
+	}
+
 	pub fn set_log_level(&self, level: LogLevel) {
 		// technically this method should take `&mut self`, but it isn't enough of an issue to warrant putting
 		// environments behind a mutex and the performance hit that comes with that
@@ -92,7 +112,6 @@ pub fn get_environment() -> Result<&'static Environment> {
 	})
 }
 
-#[derive(Debug)]
 pub struct GlobalThreadPoolOptions {
 	ptr: *mut ort_sys::OrtThreadingOptions,
 	thread_manager: Option<Box<dyn Any>>
@@ -396,6 +415,7 @@ impl EnvironmentBuilder {
 			execution_providers: self.execution_providers,
 			ptr: env_ptr,
 			has_global_threadpool,
+			provider_libraries: Mutex::new(MiniMap::new()),
 			_thread_manager: thread_manager,
 			_logger: self.logger
 		})
